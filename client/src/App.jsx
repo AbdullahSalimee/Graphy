@@ -47,9 +47,15 @@ export default function App() {
   }, []);
 
   const newConversation = () => {
-    const c = createConversation();
-    setConversations((prev) => [c, ...prev]);
-    setActiveId(c.id);
+
+    if (conversations.map((c) => c.title).includes("New conversation")) {
+
+      alert("Please rename or delete the existing 'New conversation' before creating another.");
+    }else{
+      const c = createConversation();
+      setConversations((prev) => [c, ...prev]);
+      setActiveId(c.id);
+    }
   };
 
   // Auto-scroll
