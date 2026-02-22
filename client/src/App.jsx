@@ -47,15 +47,9 @@ export default function App() {
   }, []);
 
   const newConversation = () => {
-    if (conversations.map((c) => c.title).includes("New conversation")) {
-      alert("You already have a conversation named 'New conversation'. Please rename it before creating a new one.");
-      return; // Prevent creating a new conversation with the same default name
-    }
-    else {
-      const c = createConversation();
-      setConversations((prev) => [c, ...prev]);
-      setActiveId(c.id);
-    }
+    const c = createConversation();
+    setConversations((prev) => [c, ...prev]);
+    setActiveId(c.id);
   };
 
   // Auto-scroll
