@@ -8,6 +8,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// DEBUG ROUTE - remove after confirming it works
+app.get("/api/test", (req, res) => {
+  res.json({ key: process.env.GROQ_API_KEY ? "found" : "missing" });
+});
+
 const SYSTEM_PROMPT = `You are an expert data visualization engineer specializing in Plotly.js.
 Your job is to generate stunning, professional, and insightful Plotly chart configurations.
 
@@ -98,7 +103,7 @@ app.post("/api/chart", async (req, res) => {
     if (!response.ok) {
       const err = await response.text();
       console.error("Groq error:", err);
-      return res.status(500).json({ error: "Groq API failed" });
+      return res.status(500).json({ error: "Groq API failed", detail: err });
     }
 
     const groqData = await response.json();
@@ -128,6 +133,10 @@ app.post("/api/chart", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () =>
-  console.log(`Server running on http://localhost:${PORT}`),
-);
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () =>
+    console.log(`Server running on http://localhost:${PORT}`),
+  );
+}
+
+export default app;

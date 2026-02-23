@@ -86,7 +86,7 @@ export default function App() {
     setIsLoading(true);
 
     try {
-      const res = await fetch("http://localhost:3001/api/chart", {
+      const res = await fetch("https://graph-ai-server.vercel.app/api/chart", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: input, fileContent }),
