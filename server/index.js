@@ -8,65 +8,63 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// DEBUG ROUTE - remove after confirming it works
-app.get("/api/test", (req, res) => {
-  res.json({ key: process.env.GROQ_API_KEY ? "found" : "missing" });
-});
+// ── Key rotation ──────────────────────────────────────────────────────────────
+// Reads GROQ_KEY_1, GROQ_KEY_2 ... GROQ_KEY_10 from env
+// Falls back to GROQ_API_KEY if no numbered keys found
+const KEYS = [];
+for (let i = 1; i <= 20; i++) {
+  const k = process.env[`GROQ_KEY_${i}`];
+  if (k) KEYS.push(k);
+}
+if (KEYS.length === 0 && process.env.GROQ_API_KEY) {
+  KEYS.push(process.env.GROQ_API_KEY);
+}
 
-const SYSTEM_PROMPT = `You are an expert data visualization engineer specializing in Plotly.js.
-Your job is to generate stunning, professional, and insightful Plotly chart configurations.
+console.log(`Loaded ${KEYS.length} Groq API key(s)`);
 
-OUTPUT RULES:
-- Return ONLY a valid JSON object. No markdown, no backticks, no explanation, no comments.
-- Always include "data" (array) and "layout" (object) at the top level.
-- JSON must be complete. Never truncate.
+// Track which key is current and which are exhausted
+let currentKeyIndex = 0;
+const exhaustedUntil = {}; // keyIndex → timestamp when it resets
 
-CHART QUALITY RULES:
-- Always use REALISTIC and MEANINGFUL data. Never use placeholder values like [1,2,3].
-- If the user asks for "sales data", generate realistic sales figures with proper trends.
-- If the user asks for "population", use real approximate world population data.
-- Make data tell a story — include trends, peaks, patterns that make sense.
-- Use at least 8-12 data points for time series charts.
-- For comparisons, use at least 4-6 categories.
+function getNextAvailableKey() {
+  const now = Date.now();
+  // Try each key starting from currentKeyIndex, wrap around
+  for (let i = 0; i < KEYS.length; i++) {
+    const idx = (currentKeyIndex + i) % KEYS.length;
+    if (!exhaustedUntil[idx] || exhaustedUntil[idx] < now) {
+      currentKeyIndex = idx;
+      return { key: KEYS[idx], index: idx };
+    }
+  }
+  // All keys exhausted — return the one that resets soonest
+  let soonestIdx = 0;
+  let soonestTime = Infinity;
+  for (let i = 0; i < KEYS.length; i++) {
+    if ((exhaustedUntil[i] || 0) < soonestTime) {
+      soonestTime = exhaustedUntil[i] || 0;
+      soonestIdx = i;
+    }
+  }
+  return { key: KEYS[soonestIdx], index: soonestIdx, allExhausted: true };
+}
 
-VISUAL DESIGN RULES:
-- Background: plot_bgcolor and paper_bgcolor must always be "rgba(0,0,0,0)".
-- Font color: "#e2e8f0" for all text.
-- Grid lines: "rgba(255,255,255,0.06)" subtle, not distracting.
-- Always add a descriptive title using layout.title.text.
-- Always label axes with layout.xaxis.title and layout.yaxis.title.
-- Use a color palette that feels premium. Good palettes:
-    Blues:   ["rgba(56,189,248,0.8)", "rgba(14,165,233,0.8)", "rgba(2,132,199,0.8)"]
-    Greens:  ["rgba(52,211,153,0.8)", "rgba(16,185,129,0.8)", "rgba(5,150,105,0.8)"]
-    Mixed:   ["rgba(56,189,248,0.8)", "rgba(52,211,153,0.8)", "rgba(251,191,36,0.8)", "rgba(244,114,182,0.8)", "rgba(167,139,250,0.8)"]
-    Warm:    ["rgba(251,191,36,0.8)", "rgba(245,158,11,0.8)", "rgba(239,68,68,0.8)"]
-- Always add border lines to bars/markers with slightly brighter version of fill color.
-- For line charts: use smooth curves with mode "lines+markers", add fill "tozeroy" with low opacity.
-- For bar charts: add subtle corner radius effect via marker.line.
-- For pie/donut charts: use pull: [0.05] on the largest slice, add hole: 0.4 for donut effect.
-- For scatter: vary marker sizes based on a third dimension if possible.
-- Always add layout.legend with proper styling.
-- Add layout.hoverlabel for styled tooltips.
+function markKeyExhausted(index) {
+  // Mark key as exhausted for 1 minute (Groq rate limit resets per minute)
+  exhaustedUntil[index] = Date.now() + 60 * 1000;
+  console.log(`Key #${index + 1} exhausted, switching to next...`);
+  // Move to next key
+  currentKeyIndex = (index + 1) % KEYS.length;
+}
 
-CHART TYPE SELECTION:
-- Time series data → line chart with area fill
-- Comparisons between categories → horizontal bar chart (easier to read)
-- Part of a whole → donut chart
-- Correlation between two variables → scatter plot with sized markers
-- Distribution → histogram or box plot
-- Multiple metrics over time → multi-line chart with different y-axes if scales differ
-- Geographic data → use bar chart sorted by value
-- Rankings → horizontal bar chart sorted descending
-
-ADVANCED FEATURES TO ALWAYS INCLUDE:
-- layout.hovermode: "x unified" for time series, "closest" for others
-- layout.margin: {"t": 60, "l": 60, "r": 40, "b": 60}
-- layout.font: {"family": "DM Sans, sans-serif", "color": "#e2e8f0", "size": 13}
-- layout.title.font: {"size": 18, "color": "#f1f5f9"}
-- layout.xaxis.tickfont and layout.yaxis.tickfont: {"color": "#64748b"}
-- layout.xaxis.linecolor and layout.yaxis.linecolor: "rgba(255,255,255,0.1)"
-- For multi-trace charts: always include layout.legend with bgcolor "rgba(0,0,0,0.3)" and bordercolor "rgba(255,255,255,0.1)"`;
-
+// ── System prompt ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `Generate a Plotly.js chart config as raw JSON only.
+Rules:
+- Output ONLY valid JSON with "data" array and "layout" object
+- plot_bgcolor and paper_bgcolor: "rgba(0,0,0,0)"
+- font color: "#e2e8f0"
+- Use realistic data, proper titles and axis labels
+- Make it visually beautiful with rgba colors`;
+// ── Chart route with auto key rotation ───────────────────────────────────────
 app.post("/api/chart", async (req, res) => {
   const { prompt, fileContent } = req.body;
 
@@ -75,61 +73,107 @@ app.post("/api/chart", async (req, res) => {
   }
 
   const fullPrompt = fileContent
-    ? `Analyze this data and create the best possible visualization for it:\n\n${fileContent}\n\nUser instruction: ${prompt}`
+    ? `Analyze this data and create the best possible visualization:\n\n${fileContent}\n\nUser instruction: ${prompt}`
     : `Create a professional, data-rich chart for: ${prompt}`;
 
-  try {
-    const response = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+  // Try up to KEYS.length times (once per key)
+  for (let attempt = 0; attempt < KEYS.length; attempt++) {
+    const { key, index, allExhausted } = getNextAvailableKey();
+
+    if (allExhausted) {
+      return res.status(429).json({
+        error:
+          "All API keys are temporarily exhausted. Please wait a minute and try again.",
+      });
+    }
+
+    console.log(`Attempt ${attempt + 1} using key #${index + 1}`);
+
+    try {
+      const response = await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${key}`,
+          },
+          body: JSON.stringify({
+            model: "llama-3.3-70b-versatile",
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT },
+              { role: "user", content: fullPrompt },
+            ],
+            temperature: 0.6,
+            max_tokens: 4096,
+            response_format: { type: "json_object" },
+          }),
         },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: fullPrompt },
-          ],
-          temperature: 0.6,
-          max_tokens: 4096,
-          response_format: { type: "json_object" },
-        }),
-      },
-    );
+      );
 
-    if (!response.ok) {
-      const err = await response.text();
-      console.error("Groq error:", err);
-      return res.status(500).json({ error: "Groq API failed", detail: err });
+      // Rate limited — try next key
+     if (response.status === 429 || response.status === 401 || response.status === 400) {
+
+        markKeyExhausted(index);
+        continue; // try next key
+      }
+
+
+      if (!response.ok) {
+        const err = await response.text();
+        console.error(`Key #${index + 1} error:`, err);
+        return res.status(500).json({ error: "Groq API failed", detail: err });
+      }
+
+      const groqData = await response.json();
+      const raw = groqData?.choices?.[0]?.message?.content;
+      if (!raw) throw new Error("Empty response from Groq");
+
+      const cleaned = raw
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+
+      const chartConfig = JSON.parse(cleaned);
+      if (!chartConfig.data || !chartConfig.layout) {
+        throw new Error("Invalid chart config structure");
+      }
+
+      console.log(`Success with key #${index + 1}`);
+      return res.json(chartConfig);
+    } catch (err) {
+      // If it's a network or parse error (not rate limit), don't retry
+      console.error("Chart generation error:", err);
+      return res
+        .status(500)
+        .json({ error: err.message || "Failed to generate chart" });
     }
-
-    const groqData = await response.json();
-    const raw = groqData?.choices?.[0]?.message?.content;
-
-    if (!raw) throw new Error("Empty response from Groq");
-
-    const cleaned = raw
-      .trim()
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim();
-
-    const chartConfig = JSON.parse(cleaned);
-
-    if (!chartConfig.data || !chartConfig.layout) {
-      throw new Error("Invalid chart config structure");
-    }
-
-    return res.json(chartConfig);
-  } catch (err) {
-    console.error("Chart generation error:", err);
-    return res
-      .status(500)
-      .json({ error: err.message || "Failed to generate chart" });
   }
+
+  return res
+    .status(429)
+    .json({ error: "All API keys exhausted. Try again in a minute." });
+});
+
+// ── Debug route ───────────────────────────────────────────────────────────────
+app.get("/api/status", (req, res) => {
+  const now = Date.now();
+  res.json({
+    totalKeys: KEYS.length,
+    currentKeyIndex,
+    keyStatus: KEYS.map((_, i) => ({
+      key: `Key #${i + 1}`,
+      status:
+        exhaustedUntil[i] && exhaustedUntil[i] > now
+          ? "exhausted"
+          : "available",
+      resetsIn:
+        exhaustedUntil[i] && exhaustedUntil[i] > now
+          ? `${Math.ceil((exhaustedUntil[i] - now) / 1000)}s`
+          : "ready",
+    })),
+  });
 });
 
 const PORT = process.env.PORT || 3001;

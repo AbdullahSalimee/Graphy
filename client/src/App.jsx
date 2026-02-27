@@ -6,25 +6,19 @@ import StarField from "./components/StarField";
 import WaveHero from "./components/WaveHero";
 import { createConversation } from "./utils/conversations";
 
+// Create the initial conversation once, outside component to avoid double-init
+const INITIAL_CONV = createConversation();
+
 export default function App() {
-  const [conversations, setConversations] = useState(() => {
-    const first = createConversation();
-    return [first];
-  });
-  const [activeId, setActiveId] = useState(() => {
-    const first = createConversation();
-    setConversations([first]);
-    return first.id;
-  });
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [conversations, setConversations] = useState([INITIAL_CONV]);
+  const [activeId, setActiveId] = useState(INITIAL_CONV.id);
+  const [sidebarOpen, setSidebarOpen] = useState(false); // default closed on mobile
   const [isLoading, setIsLoading] = useState(false);
   const chatRef = useRef(null);
 
-  // Fix double-init from useState lazy
+  // Open sidebar by default only on desktop
   useEffect(() => {
-    const first = createConversation();
-    setConversations([first]);
-    setActiveId(first.id);
+    if (window.innerWidth >= 640) setSidebarOpen(true);
   }, []);
 
   const activeConv = conversations.find((c) => c.id === activeId);
@@ -33,38 +27,55 @@ export default function App() {
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== convId) return c;
-        const messages = typeof updater === "function" ? updater(c.messages) : updater;
+        const messages =
+          typeof updater === "function" ? updater(c.messages) : updater;
         const firstUser = messages.find((m) => m.from === "user");
         return {
           ...c,
           messages,
           title: firstUser
-            ? firstUser.content.slice(0, 30) + (firstUser.content.length > 30 ? "…" : "")
+            ? firstUser.content.slice(0, 30) +
+              (firstUser.content.length > 30 ? "…" : "")
             : c.title,
         };
-      })
+      }),
     );
   }, []);
 
   const newConversation = () => {
-
-    if (conversations.map((c) => c.title).includes("New conversation")) {
-
-      alert("Please rename or delete the existing 'New conversation' before creating another.");
-    }else{
+    // Check if there's already an empty new conversation
+    const hasEmpty = conversations.some(
+      (c) => c.title === "New conversation" && c.messages.length === 0,
+    );
+    if (hasEmpty) {
+      // Just switch to the existing empty one
+      const empty = conversations.find(
+        (c) => c.title === "New conversation" && c.messages.length === 0,
+      );
+      setActiveId(empty.id);
+    } else {
       const c = createConversation();
       setConversations((prev) => [c, ...prev]);
       setActiveId(c.id);
     }
+    // Close sidebar on mobile after selecting
+    if (window.innerWidth < 640) setSidebarOpen(false);
   };
 
-  // Auto-scroll
+  const handleSelect = (id) => {
+    setActiveId(id);
+    if (window.innerWidth < 640) setSidebarOpen(false);
+  };
+
+  // Auto-scroll chat to bottom
   useEffect(() => {
     if (chatRef.current) {
-      setTimeout(
-        () => chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" }),
-        80
-      );
+      setTimeout(() => {
+        chatRef.current?.scrollTo({
+          top: chatRef.current.scrollHeight,
+          behavior: "smooth",
+        });
+      }, 80);
     }
   }, [activeConv?.messages?.length]);
 
@@ -80,7 +91,12 @@ export default function App() {
       hasFile: !!fileContent,
       fileName,
     };
-    const aiMsg = { id: crypto.randomUUID(), from: "ai", content: "", status: "loading" };
+    const aiMsg = {
+      id: crypto.randomUUID(),
+      from: "ai",
+      content: "",
+      status: "loading",
+    };
 
     updateMessages(convId, (msgs) => [...msgs, userMsg, aiMsg]);
     setIsLoading(true);
@@ -93,22 +109,28 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Server error");
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server error ${res.status}`);
       }
 
       const config = await res.json();
 
       updateMessages(convId, (msgs) =>
-        msgs.map((m) => (m.id === aiMsg.id ? { ...m, content: config, status: "success" } : m))
+        msgs.map((m) =>
+          m.id === aiMsg.id ? { ...m, content: config, status: "success" } : m,
+        ),
       );
     } catch (err) {
       updateMessages(convId, (msgs) =>
         msgs.map((m) =>
           m.id === aiMsg.id
-            ? { ...m, content: err.message || "Failed to generate chart", status: "error" }
-            : m
-        )
+            ? {
+                ...m,
+                content: err.message || "Failed to generate chart",
+                status: "error",
+              }
+            : m,
+        ),
       );
     } finally {
       setIsLoading(false);
@@ -121,11 +143,19 @@ export default function App() {
     <>
       <StarField />
       <div className="app-shell">
+        {/* Mobile backdrop */}
+        {sidebarOpen && (
+          <div
+            className="sidebar-backdrop"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+
         {sidebarOpen && (
           <Sidebar
             conversations={conversations}
             activeId={activeId}
-            onSelect={setActiveId}
+            onSelect={handleSelect}
             onNew={newConversation}
             onClose={() => setSidebarOpen(false)}
           />
@@ -135,16 +165,26 @@ export default function App() {
           {/* Topbar */}
           <div className="topbar">
             {!sidebarOpen && (
-              <button className="icon-btn" onClick={() => setSidebarOpen(true)}>
+              <button
+                className="icon-btn"
+                onClick={() => setSidebarOpen(true)}
+                aria-label="Open sidebar"
+              >
                 <MenuIcon />
               </button>
             )}
-            <span className="topbar-title">{activeConv?.title || "Graph AI"}</span>
+            <span className="topbar-title">
+              {activeConv?.title || "Graph AI"}
+            </span>
           </div>
 
           {/* Chat */}
           <div className="chat-area" ref={chatRef}>
-            {!hasMessages ? <WaveHero /> : <ChatArea messages={activeConv.messages} />}
+            {!hasMessages ? (
+              <WaveHero />
+            ) : (
+              <ChatArea messages={activeConv.messages} />
+            )}
           </div>
 
           {/* Input */}
@@ -157,7 +197,15 @@ export default function App() {
 
 function MenuIcon() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+    >
       <line x1="3" y1="6" x2="21" y2="6" />
       <line x1="3" y1="12" x2="21" y2="12" />
       <line x1="3" y1="18" x2="21" y2="18" />
