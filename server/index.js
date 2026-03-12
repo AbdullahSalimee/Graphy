@@ -6,54 +6,46 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// ── Key rotation ──────────────────────────────────────────────────────────────
-// Reads GROQ_KEY_1, GROQ_KEY_2 ... GROQ_KEY_10 from env
-// Falls back to GROQ_API_KEY if no numbered keys found
+// ── Key pool ──────────────────────────────────────────────────────────────────
 const KEYS = [];
 for (let i = 1; i <= 20; i++) {
   const k = process.env[`GROQ_KEY_${i}`];
-  if (k) KEYS.push(k);
+  if (k) KEYS.push(k.trim());
 }
 if (KEYS.length === 0 && process.env.GROQ_API_KEY) {
-  KEYS.push(process.env.GROQ_API_KEY);
+  KEYS.push(process.env.GROQ_API_KEY.trim());
 }
-
 console.log(`Loaded ${KEYS.length} Groq API key(s)`);
 
-// Track which key is current and which are exhausted
-let currentKeyIndex = 0;
-const exhaustedUntil = {}; // keyIndex → timestamp when it resets
+// Per-key state
+const keyState = KEYS.map(() => ({
+  exhaustedUntil: 0, // timestamp
+  failures: 0, // consecutive failures
+}));
 
-function getNextAvailableKey() {
+let rrIndex = 0; // round-robin pointer
+
+/** Return the index of the next usable key, or -1 if all exhausted */
+function pickKey() {
   const now = Date.now();
-  // Try each key starting from currentKeyIndex, wrap around
   for (let i = 0; i < KEYS.length; i++) {
-    const idx = (currentKeyIndex + i) % KEYS.length;
-    if (!exhaustedUntil[idx] || exhaustedUntil[idx] < now) {
-      currentKeyIndex = idx;
-      return { key: KEYS[idx], index: idx };
+    const idx = (rrIndex + i) % KEYS.length;
+    if (keyState[idx].exhaustedUntil <= now) {
+      rrIndex = (idx + 1) % KEYS.length; // advance pointer past this one
+      return idx;
     }
   }
-  // All keys exhausted — return the one that resets soonest
-  let soonestIdx = 0;
-  let soonestTime = Infinity;
-  for (let i = 0; i < KEYS.length; i++) {
-    if ((exhaustedUntil[i] || 0) < soonestTime) {
-      soonestTime = exhaustedUntil[i] || 0;
-      soonestIdx = i;
-    }
-  }
-  return { key: KEYS[soonestIdx], index: soonestIdx, allExhausted: true };
+  return -1; // all exhausted
 }
 
-function markKeyExhausted(index) {
-  // Mark key as exhausted for 1 minute (Groq rate limit resets per minute)
-  exhaustedUntil[index] = Date.now() + 60 * 1000;
-  console.log(`Key #${index + 1} exhausted, switching to next...`);
-  // Move to next key
-  currentKeyIndex = (index + 1) % KEYS.length;
+function exhaustKey(idx, seconds = 62) {
+  keyState[idx].exhaustedUntil = Date.now() + seconds * 1000;
+  keyState[idx].failures++;
+  console.warn(
+    `Key #${idx + 1} exhausted for ${seconds}s (failures: ${keyState[idx].failures})`,
+  );
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────
@@ -64,7 +56,20 @@ Rules:
 - font color: "#e2e8f0"
 - Use realistic data, proper titles and axis labels
 - Make it visually beautiful with rgba colors`;
-// ── Chart route with auto key rotation ───────────────────────────────────────
+
+// ── Fetch with timeout ────────────────────────────────────────────────────────
+async function fetchWithTimeout(url, options, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Chart route ───────────────────────────────────────────────────────────────
 app.post("/api/chart", async (req, res) => {
   const { prompt, fileContent } = req.body;
 
@@ -76,27 +81,33 @@ app.post("/api/chart", async (req, res) => {
     ? `Analyze this data and create the best possible visualization:\n\n${fileContent}\n\nUser instruction: ${prompt}`
     : `Create a professional, data-rich chart for: ${prompt}`;
 
-  // Try up to KEYS.length times (once per key)
-  for (let attempt = 0; attempt < KEYS.length; attempt++) {
-    const { key, index, allExhausted } = getNextAvailableKey();
+  const maxAttempts = KEYS.length * 2; // allow cycling through all keys twice
 
-    if (allExhausted) {
-      return res.status(429).json({
-        error:
-          "All API keys are temporarily exhausted. Please wait a minute and try again.",
-      });
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const idx = pickKey();
+
+    if (idx === -1) {
+      // All keys exhausted — find soonest reset
+      const soonest = Math.min(...keyState.map((s) => s.exhaustedUntil));
+      const waitMs = Math.max(0, soonest - Date.now());
+      console.log(
+        `All keys exhausted. Waiting ${Math.ceil(waitMs / 1000)}s...`,
+      );
+      await new Promise((r) => setTimeout(r, waitMs + 500));
+      continue;
     }
 
-    console.log(`Attempt ${attempt + 1} using key #${index + 1}`);
+    console.log(`Attempt ${attempt + 1}/${maxAttempts} — key #${idx + 1}`);
 
+    let response;
     try {
-      const response = await fetch(
+      response = await fetchWithTimeout(
         "https://api.groq.com/openai/v1/chat/completions",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${key}`,
+            Authorization: `Bearer ${KEYS[idx]}`,
           },
           body: JSON.stringify({
             model: "llama-3.3-70b-versatile",
@@ -109,69 +120,119 @@ app.post("/api/chart", async (req, res) => {
             response_format: { type: "json_object" },
           }),
         },
+        25000, // 25s timeout per key attempt
       );
+    } catch (fetchErr) {
+      // Network error or timeout — mark key and retry
+      console.warn(`Key #${idx + 1} fetch failed: ${fetchErr.message}`);
+      exhaustKey(idx, 30); // shorter cooldown for network errors
+      continue;
+    }
 
-      // Rate limited — try next key
-     if (response.status === 429 || response.status === 401 || response.status === 400) {
+    // Rate limited or auth error → rotate key
+    if (response.status === 429) {
+      // Parse retry-after if present
+      const retryAfter = parseInt(
+        response.headers.get("retry-after") || "62",
+        10,
+      );
+      exhaustKey(idx, retryAfter + 2);
+      continue;
+    }
 
-        markKeyExhausted(index);
-        continue; // try next key
+    if (response.status === 401 || response.status === 403) {
+      exhaustKey(idx, 3600); // bad key — long cooldown
+      console.error(`Key #${idx + 1} is invalid (${response.status})`);
+      continue;
+    }
+
+    if (
+      response.status === 503 ||
+      response.status === 502 ||
+      response.status === 504
+    ) {
+      exhaustKey(idx, 15);
+      continue;
+    }
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "unknown");
+      console.error(`Key #${idx + 1} unexpected ${response.status}:`, errText);
+      // Don't retry on 400 (bad request) — that's a prompt issue
+      if (response.status === 400) {
+        return res
+          .status(400)
+          .json({ error: "Bad request to Groq", detail: errText });
       }
+      exhaustKey(idx, 30);
+      continue;
+    }
 
+    // ── Parse response ────────────────────────────────────────────────────────
+    let groqData;
+    try {
+      groqData = await response.json();
+    } catch {
+      console.warn(`Key #${idx + 1} returned non-JSON body`);
+      exhaustKey(idx, 10);
+      continue;
+    }
 
-      if (!response.ok) {
-        const err = await response.text();
-        console.error(`Key #${index + 1} error:`, err);
-        return res.status(500).json({ error: "Groq API failed", detail: err });
-      }
+    const raw = groqData?.choices?.[0]?.message?.content;
+    if (!raw) {
+      console.warn(`Key #${idx + 1} returned empty content`);
+      exhaustKey(idx, 10);
+      continue;
+    }
 
-      const groqData = await response.json();
-      const raw = groqData?.choices?.[0]?.message?.content;
-      if (!raw) throw new Error("Empty response from Groq");
-
+    // ── Clean & parse chart JSON ──────────────────────────────────────────────
+    let chartConfig;
+    try {
       const cleaned = raw
         .trim()
         .replace(/^```(?:json)?\s*/i, "")
         .replace(/\s*```$/i, "")
         .trim();
-
-      const chartConfig = JSON.parse(cleaned);
-      if (!chartConfig.data || !chartConfig.layout) {
-        throw new Error("Invalid chart config structure");
-      }
-
-      console.log(`Success with key #${index + 1}`);
-      return res.json(chartConfig);
-    } catch (err) {
-      // If it's a network or parse error (not rate limit), don't retry
-      console.error("Chart generation error:", err);
-      return res
-        .status(500)
-        .json({ error: err.message || "Failed to generate chart" });
+      chartConfig = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.warn(`Key #${idx + 1} returned invalid JSON:`, raw.slice(0, 200));
+      // Don't exhaust the key — this is a model output issue, retry with same pool
+      // but mark a short cooldown to avoid hammering
+      exhaustKey(idx, 5);
+      continue;
     }
+
+    if (!chartConfig.data || !chartConfig.layout) {
+      console.warn(`Key #${idx + 1} returned wrong structure`);
+      exhaustKey(idx, 5);
+      continue;
+    }
+
+    console.log(`✓ Success with key #${idx + 1} on attempt ${attempt + 1}`);
+    // Reset failure count on success
+    keyState[idx].failures = 0;
+    return res.json(chartConfig);
   }
 
-  return res
-    .status(429)
-    .json({ error: "All API keys exhausted. Try again in a minute." });
+  return res.status(503).json({
+    error:
+      "All API keys exhausted after maximum retries. Please wait a minute.",
+  });
 });
 
-// ── Debug route ───────────────────────────────────────────────────────────────
+// ── Status route ──────────────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
   const now = Date.now();
   res.json({
     totalKeys: KEYS.length,
-    currentKeyIndex,
-    keyStatus: KEYS.map((_, i) => ({
-      key: `Key #${i + 1}`,
-      status:
-        exhaustedUntil[i] && exhaustedUntil[i] > now
-          ? "exhausted"
-          : "available",
+    keys: keyState.map((s, i) => ({
+      id: `Key #${i + 1}`,
+      status: s.exhaustedUntil > now ? "exhausted" : "available",
       resetsIn:
-        exhaustedUntil[i] && exhaustedUntil[i] > now
-          ? `${Math.ceil((exhaustedUntil[i] - now) / 1000)}s`
+        s.exhaustedUntil > now
+          ? `${Math.ceil((s.exhaustedUntil - now) / 1000)}s`
           : "ready",
+      failures: s.failures,
     })),
   });
 });
