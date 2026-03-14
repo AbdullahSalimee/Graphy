@@ -1,93 +1,77 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
+import multer from "multer";
 
-dotenv.config();
+import authRoutes from "./routes/auth.js";
+import userRoutes from "./routes/user.js";
+import chartRoutes from "./routes/charts.js";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const upload = multer();
 
-// ── Key rotation ──────────────────────────────────────────────────────────────
-// Reads GROQ_KEY_1, GROQ_KEY_2 ... GROQ_KEY_10 from env
-// Falls back to GROQ_API_KEY if no numbered keys found
-const KEYS = [];
-for (let i = 1; i <= 20; i++) {
-  const k = process.env[`GROQ_KEY_${i}`];
-  if (k) KEYS.push(k);
-}
-if (KEYS.length === 0 && process.env.GROQ_API_KEY) {
-  KEYS.push(process.env.GROQ_API_KEY);
-}
+// ── CORS ─────────────────────────────────────────────────────
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    credentials: true,
+  }),
+);
 
-console.log(`Loaded ${KEYS.length} Groq API key(s)`);
+app.use(express.json({ limit: "10mb" }));
 
-// Track which key is current and which are exhausted
+// ── API Routes ────────────────────────────────────────────────
+app.use("/api/auth", authRoutes);
+app.use("/api/user", userRoutes);
+app.use("/api/charts", chartRoutes);
+
+// ── AI Chart Generation (Groq) ────────────────────────────────
+const KEYS = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
 let currentKeyIndex = 0;
-const exhaustedUntil = {}; // keyIndex → timestamp when it resets
+const exhaustedUntil = {};
 
 function getNextAvailableKey() {
   const now = Date.now();
-  // Try each key starting from currentKeyIndex, wrap around
   for (let i = 0; i < KEYS.length; i++) {
     const idx = (currentKeyIndex + i) % KEYS.length;
-    if (!exhaustedUntil[idx] || exhaustedUntil[idx] < now) {
-      currentKeyIndex = idx;
-      return { key: KEYS[idx], index: idx };
+    if (!exhaustedUntil[idx] || exhaustedUntil[idx] <= now) {
+      currentKeyIndex = (idx + 1) % KEYS.length;
+      return { key: KEYS[idx], index: idx, allExhausted: false };
     }
   }
-  // All keys exhausted — return the one that resets soonest
-  let soonestIdx = 0;
-  let soonestTime = Infinity;
-  for (let i = 0; i < KEYS.length; i++) {
-    if ((exhaustedUntil[i] || 0) < soonestTime) {
-      soonestTime = exhaustedUntil[i] || 0;
-      soonestIdx = i;
-    }
-  }
-  return { key: KEYS[soonestIdx], index: soonestIdx, allExhausted: true };
+  return { key: null, index: -1, allExhausted: true };
 }
 
 function markKeyExhausted(index) {
-  // Mark key as exhausted for 1 minute (Groq rate limit resets per minute)
-  exhaustedUntil[index] = Date.now() + 60 * 1000;
-  console.log(`Key #${index + 1} exhausted, switching to next...`);
-  // Move to next key
-  currentKeyIndex = (index + 1) % KEYS.length;
+  exhaustedUntil[index] = Date.now() + 60_000;
+  console.warn(`Key #${index + 1} exhausted. Retry after 60s.`);
 }
 
-// ── System prompt ─────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Generate a Plotly.js chart config as raw JSON only.
-Rules:
-- Output ONLY valid JSON with "data" array and "layout" object
-- plot_bgcolor and paper_bgcolor: "rgba(0,0,0,0)"
-- font color: "#e2e8f0"
-- Use realistic data, proper titles and axis labels
-- Make it visually beautiful with rgba colors`;
-// ── Chart route with auto key rotation ───────────────────────────────────────
-app.post("/api/chart", async (req, res) => {
-  const { prompt, fileContent } = req.body;
+const SYSTEM_PROMPT = `You are a professional data visualization expert. Generate Plotly.js chart configurations.
+Always respond with valid JSON containing exactly two keys: "data" (array of trace objects) and "layout" (layout object).
+Use professional color schemes. Make charts visually appealing with proper titles, labels, and formatting.`;
 
-  if (!prompt || typeof prompt !== "string") {
-    return res.status(400).json({ error: "Invalid prompt" });
-  }
+app.post("/api/chart", upload.single("file"), async (req, res) => {
+  const { prompt, fileContent } = req.body;
+  if (!prompt) return res.status(400).json({ error: "Prompt is required" });
 
   const fullPrompt = fileContent
     ? `Analyze this data and create the best possible visualization:\n\n${fileContent}\n\nUser instruction: ${prompt}`
     : `Create a professional, data-rich chart for: ${prompt}`;
 
-  // Try up to KEYS.length times (once per key)
   for (let attempt = 0; attempt < KEYS.length; attempt++) {
     const { key, index, allExhausted } = getNextAvailableKey();
-
     if (allExhausted) {
-      return res.status(429).json({
-        error:
-          "All API keys are temporarily exhausted. Please wait a minute and try again.",
-      });
+      return res
+        .status(429)
+        .json({
+          error: "All API keys temporarily exhausted. Please wait a minute.",
+        });
     }
-
-    console.log(`Attempt ${attempt + 1} using key #${index + 1}`);
 
     try {
       const response = await fetch(
@@ -111,17 +95,17 @@ app.post("/api/chart", async (req, res) => {
         },
       );
 
-      // Rate limited — try next key
-     if (response.status === 429 || response.status === 401 || response.status === 400) {
-
+      if (
+        response.status === 429 ||
+        response.status === 401 ||
+        response.status === 400
+      ) {
         markKeyExhausted(index);
-        continue; // try next key
+        continue;
       }
-
 
       if (!response.ok) {
         const err = await response.text();
-        console.error(`Key #${index + 1} error:`, err);
         return res.status(500).json({ error: "Groq API failed", detail: err });
       }
 
@@ -134,16 +118,13 @@ app.post("/api/chart", async (req, res) => {
         .replace(/^```(?:json)?\s*/i, "")
         .replace(/\s*```$/i, "")
         .trim();
-
       const chartConfig = JSON.parse(cleaned);
-      if (!chartConfig.data || !chartConfig.layout) {
-        throw new Error("Invalid chart config structure");
-      }
 
-      console.log(`Success with key #${index + 1}`);
+      if (!chartConfig.data || !chartConfig.layout)
+        throw new Error("Invalid chart config structure");
+
       return res.json(chartConfig);
     } catch (err) {
-      // If it's a network or parse error (not rate limit), don't retry
       console.error("Chart generation error:", err);
       return res
         .status(500)
@@ -156,31 +137,12 @@ app.post("/api/chart", async (req, res) => {
     .json({ error: "All API keys exhausted. Try again in a minute." });
 });
 
-// ── Debug route ───────────────────────────────────────────────────────────────
+// ── Status ────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
-  const now = Date.now();
-  res.json({
-    totalKeys: KEYS.length,
-    currentKeyIndex,
-    keyStatus: KEYS.map((_, i) => ({
-      key: `Key #${i + 1}`,
-      status:
-        exhaustedUntil[i] && exhaustedUntil[i] > now
-          ? "exhausted"
-          : "available",
-      resetsIn:
-        exhaustedUntil[i] && exhaustedUntil[i] > now
-          ? `${Math.ceil((exhaustedUntil[i] - now) / 1000)}s`
-          : "ready",
-    })),
-  });
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3001;
-if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, () =>
-    console.log(`Server running on http://localhost:${PORT}`),
-  );
-}
-
-export default app;
+app.listen(PORT, () =>
+  console.log(`✅ Graphix server running on http://localhost:${PORT}`),
+);
