@@ -66,12 +66,16 @@ WHEN TO RETURN AN ERROR (only these two cases):
 VALID chart response — ONLY this JSON:
 {"data": [...], "layout": {...}}
 
+
 Chart JSON rules:
 - paper_bgcolor and plot_bgcolor: "rgba(0,0,0,0)"
 - font.color: "#e2e8f0"
 - Always include title and axis labels
 - Invent realistic, interesting demo data when none is provided
-- Pick the best chart type; if user specifies one, use it`;
+- Pick the best chart type; if user specifies one, use it
+- make the 3d chart with care to ensure it looks good with demo data
+`;
+
 
 // ── Chart route ───────────────────────────────────────────────────────────────
 app.post("/api/chart", async (req, res) => {
