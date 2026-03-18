@@ -6,6 +6,7 @@ import multer from "multer";
 import authRoutes from "./routes/auth.js";
 import userRoutes from "./routes/user.js";
 import chartRoutes from "./routes/charts.js";
+import feedbackRoutes from "./routes/feedback.js";
 
 const app = express();
 const upload = multer();
@@ -24,6 +25,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api/charts", chartRoutes);
+app.use("/api/feedback", feedbackRoutes);
 
 // ── AI Chart Generation (Groq) ────────────────────────────────
 const KEYS = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
