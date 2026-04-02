@@ -3,10 +3,10 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 
-import authRoutes from "../routes/auth.js";
-import userRoutes from "../routes/user.js";
-import chartRoutes from "../routes/charts.js";
-import feedbackRoutes from "../routes/feedback.js";
+import authRoutes from "./routes/auth.js";
+import userRoutes from "./routes/user.js";
+import chartRoutes from "./routes/charts.js";
+import feedbackRoutes from "./routes/feedback.js";
 
 const app = express();
 const upload = multer();
